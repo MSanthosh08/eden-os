@@ -1,0 +1,310 @@
+# EDEN reference configuration.
+#
+# Copy to `eden.toml` and edit. Every value here can also be supplied as an
+# environment variable using the EDEN__SECTION__KEY convention, e.g.
+#
+#   EDEN__LOGGING__LEVEL=DEBUG
+#   EDEN__GATEWAY__ROUTER__STRATEGY=cheapest
+#
+# Precedence, lowest to highest:
+#   schema defaults  <  this file  <  environment  <  runtime overrides
+#
+# CREDENTIALS ARE NEVER STORED HERE. `api_key_env` names the environment
+# variable that holds the key; EDEN resolves it lazily and wraps it in a type
+# whose repr is redacted.
+
+app_name = "eden"
+environment = "development"   # development | testing | staging | production
+version = "0.1.0"
+
+[paths]
+root = ".eden"                # data_dir, cache_dir, log_dir, plugin_dir derive from this
+
+[logging]
+level = "INFO"                # DEBUG | INFO | WARNING | ERROR | CRITICAL
+format = "console"            # console for humans, json for log shippers
+to_file = false
+redact_keys = ["api_key", "authorization", "password", "secret", "token"]
+log_timings = true
+
+[server]
+host = "127.0.0.1"
+port = 8420
+
+[memory]
+enabled = true
+persist = true                    # false keeps everything in process
+short_term_capacity = 200         # records per namespace before eviction
+short_term_ttl_seconds = 3600
+conversation_turn_limit = 100
+conversation_token_budget = 4000  # ceiling when building a prompt window
+long_term_max_records = 100000
+vector_model = ""                 # empty lets the router choose
+vector_dimensions = 256           # width of the offline hash embedder
+vector_min_similarity = 0.0       # cosine floor; hits below it are discarded
+default_search_limit = 10
+consolidate_after_turns = 50      # above this, old turns are summarised away
+consolidation_keep_turns = 10     # recent turns left untouched
+consolidation_summary_words = 200
+
+[agents]
+enabled = true
+max_plan_steps = 20               # plans longer than this are refused
+min_suitability = 0.1             # agents scoring below this are not considered
+rollback_on_verification_failure = true
+planning_temperature = 0.2
+planning_model = ""               # empty lets the router choose
+recall_limit = 5                  # memories pulled into an agent's context
+task_timeout_seconds = 300.0
+
+# ---------------------------------------------------------------------------
+# Execution.
+#
+# Defaults are deny-first: no command is runnable until you name it, and
+# anything that cannot be undone requires confirmation whatever its risk.
+# ---------------------------------------------------------------------------
+[execution]
+enabled = true
+dry_run = false                   # true verifies and permits, then stops
+default_mode = "confirm"          # automatic | confirm | deny
+auto_approve_max_risk = "low"     # reversible actions at or below this just run
+deny_above_risk = "high"          # above this, no approval path exists
+require_reversible = false        # true refuses anything with no rollback plan
+workspace_root = ".eden/workspace"
+timeout_seconds = 60.0
+max_transaction_actions = 50
+max_payload_bytes = 5242880
+journal_enabled = true
+
+# Empty means no shell command can run at all. Name executables to permit them;
+# they are invoked directly, never through a shell.
+allowed_commands = []
+
+# Refused regardless of workspace scope.
+denied_path_globs = [
+  "**/.env", "**/.env.*", "**/.git/**", "**/.ssh/**",
+  "**/id_rsa*", "**/*.pem", "**/*.key", "**/credentials*",
+]
+
+# ---------------------------------------------------------------------------
+# Hardware. Off by default: software that can move things should not be able to
+# move things the moment it is installed.
+#
+# Reads are direct. Actuation is an execution action, so every command is
+# verified, authorised, journalled and (usually) reversible.
+# ---------------------------------------------------------------------------
+[hardware]
+enabled = false
+read_only = false             # true permits reads and refuses every command
+connect_timeout_seconds = 15.0
+
+  # [[hardware.devices]]
+  # name = "rig"
+  # kind = "simulated"        # simulated | http | custom
+  # channels = ["servo", "temp"]
+  # timeout_seconds = 10.0
+  # max_commands_per_minute = 600
+  #
+  #   [hardware.devices.limits]
+  #   servo = [0.0, 90.0]     # a command outside this range is refused
+
+# ---------------------------------------------------------------------------
+# Automation. Off by default. Rules are registered in code or through the API;
+# a rule carries a task or an action, never a callable.
+# ---------------------------------------------------------------------------
+[automation]
+enabled = false
+tick_seconds = 1.0
+max_concurrent_runs = 4
+run_timeout_seconds = 300.0
+catch_up = false              # false skips windows missed while stopped
+history_limit = 200
+
+# ---------------------------------------------------------------------------
+# Interface. Off by default, loopback by default. This server has NO
+# AUTHENTICATION and must not be bound to a public address.
+# ---------------------------------------------------------------------------
+[interface]
+enabled = false
+host = "127.0.0.1"
+port = 8420                   # 0 asks the OS for a free port
+allow_actions = true          # false makes the console observe-only
+approval_timeout_seconds = 120.0   # silence becomes refusal, never consent
+
+[gateway]
+request_timeout_seconds = 120.0
+stream_chunk_timeout_seconds = 30.0
+
+[gateway.router]
+strategy = "balanced"         # balanced | cheapest | fastest | privacy_first | round_robin
+minimum_privacy_tier = "public_cloud"
+failover_enabled = true
+max_failovers = 2
+
+[gateway.router.weights]
+cost = 1.0
+latency = 1.0
+health = 1.5
+privacy = 0.5
+preference = 1.0
+
+[gateway.router.circuit_breaker]
+failure_threshold = 5
+reset_seconds = 30.0
+half_open_successes = 2
+
+# ---------------------------------------------------------------------------
+# Providers.
+#
+# Note that six of the eight entries below share one adapter
+# (`openai_compatible`). They differ only in base_url, credential and
+# catalogue — which is the point: adding a vendor is a config change.
+# ---------------------------------------------------------------------------
+
+[[gateway.providers]]
+name = "openai"
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+default_model = "gpt-4o-mini"
+privacy_tier = "public_cloud"
+requests_per_minute = 500
+weight = 1.0
+
+  [[gateway.providers.models]]
+  name = "gpt-4o-mini"
+  capabilities = ["chat", "streaming", "tool_use", "vision", "json_mode"]
+  context_window = 128000
+  input_cost_per_1k = 0.15
+  output_cost_per_1k = 0.60
+  expected_latency_ms = 900
+
+  # Advertising "embedding" is what makes this provider eligible for vector
+  # memory. With no such model anywhere, EDEN falls back to the offline
+  # embedder rather than losing semantic recall.
+  [[gateway.providers.models]]
+  name = "text-embedding-3-small"
+  capabilities = ["embedding"]
+  context_window = 8191
+  input_cost_per_1k = 0.02
+  output_cost_per_1k = 0.0
+  expected_latency_ms = 250
+
+[[gateway.providers]]
+name = "anthropic"
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-5"
+privacy_tier = "public_cloud"
+
+  [[gateway.providers.models]]
+  name = "claude-sonnet-4-5"
+  capabilities = ["chat", "streaming", "tool_use", "vision", "long_context", "reasoning"]
+  context_window = 200000
+  input_cost_per_1k = 3.0
+  output_cost_per_1k = 15.0
+  expected_latency_ms = 1400
+
+[[gateway.providers]]
+name = "gemini"
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GOOGLE_API_KEY"
+default_model = "gemini-2.0-flash"
+
+  [[gateway.providers.models]]
+  name = "gemini-2.0-flash"
+  capabilities = ["chat", "streaming", "vision", "long_context"]
+  context_window = 1000000
+  input_cost_per_1k = 0.10
+  output_cost_per_1k = 0.40
+  expected_latency_ms = 700
+
+[[gateway.providers]]
+name = "groq"
+kind = "openai_compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+default_model = "llama-3.3-70b-versatile"
+
+  [[gateway.providers.models]]
+  name = "llama-3.3-70b-versatile"
+  capabilities = ["chat", "streaming", "tool_use"]
+  context_window = 128000
+  input_cost_per_1k = 0.59
+  output_cost_per_1k = 0.79
+  expected_latency_ms = 180        # Groq's edge is speed; the router will exploit it.
+
+[[gateway.providers]]
+name = "deepseek"
+kind = "openai_compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-chat"
+
+  [[gateway.providers.models]]
+  name = "deepseek-chat"
+  capabilities = ["chat", "streaming", "code", "reasoning"]
+  context_window = 64000
+  input_cost_per_1k = 0.14
+  output_cost_per_1k = 0.28
+  expected_latency_ms = 1500
+
+[[gateway.providers]]
+name = "together"
+kind = "openai_compatible"
+base_url = "https://api.together.xyz/v1"
+api_key_env = "TOGETHER_API_KEY"
+default_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+enabled = false
+
+  [[gateway.providers.models]]
+  name = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+  capabilities = ["chat", "streaming"]
+  input_cost_per_1k = 0.88
+  output_cost_per_1k = 0.88
+
+[[gateway.providers]]
+name = "openrouter"
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+default_model = "openai/gpt-4o-mini"
+enabled = false
+
+  [gateway.providers.headers]
+  "http-referer" = "https://eden.local"
+  "x-title" = "EDEN"
+
+  [[gateway.providers.models]]
+  name = "openai/gpt-4o-mini"
+  capabilities = ["chat", "streaming"]
+  input_cost_per_1k = 0.15
+  output_cost_per_1k = 0.60
+
+# Local inference. Zero cost, strongest privacy tier — a request carrying
+# `minimum_privacy_tier = "local_only"` can reach nothing else.
+[[gateway.providers]]
+name = "ollama"
+kind = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+default_model = "llama3.2"
+privacy_tier = "local_only"
+timeout_seconds = 300.0
+
+  [[gateway.providers.models]]
+  name = "llama3.2"
+  capabilities = ["chat", "streaming"]
+  context_window = 131072
+  input_cost_per_1k = 0.0
+  output_cost_per_1k = 0.0
+  expected_latency_ms = 2500
+
+# A vendor EDEN has never heard of. No source change required.
+# [[gateway.providers]]
+# name = "in-house"
+# kind = "custom"
+# implementation = "my_company.eden_plugins:InHouseProvider"
+# default_model = "internal-v2"
+# privacy_tier = "on_premise"
