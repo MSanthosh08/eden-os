@@ -21,7 +21,7 @@ version = "0.1.0"
 root = ".eden"                # data_dir, cache_dir, log_dir, plugin_dir derive from this
 
 [logging]
-level = "INFO"                # DEBUG | INFO | WARNING | ERROR | CRITICAL
+level = "WARNING"                # DEBUG | INFO | WARNING | ERROR | CRITICAL
 format = "console"            # console for humans, json for log shippers
 to_file = false
 redact_keys = ["api_key", "authorization", "password", "secret", "token"]
