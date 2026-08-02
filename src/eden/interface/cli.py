@@ -30,7 +30,7 @@ from typing import Any
 
 from eden.agents.types import Task
 from eden.config.enums import LogLevel
-from eden.config.loader import load_config
+from eden.config.loader import DEFAULT_CONFIG_FILENAME, ConfigLoader
 from eden.config.schema import EdenConfig
 from eden.core.kernel import EdenKernel
 from eden.core.types import ChatRequest, Message
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     memory = sub.add_parser("memory", help="search remembered things")
     memory.add_argument("query", nargs="*", default=[], help="search text")
-    memory.add_argument("--namespace", default="default")
+    memory.add_argument("--namespace", default="cli")
     memory.add_argument("--limit", type=int, default=10)
 
     sub.add_parser("devices", help="list the device fleet")
@@ -89,10 +89,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load(args: argparse.Namespace) -> EdenConfig:
-    """Build configuration from the file, environment and CLI overrides."""
+    """Build configuration from the file, environment and CLI overrides.
+
+    The CLI is interactive, so it defaults to a quiet log level — the
+    subsystem startup/shutdown trace is operational detail a long-running
+    service benefits from, but it is noise for someone running one command
+    and reading its answer. That quiet default only applies when nothing
+    else has asked for a level: a person's own ``eden.toml``, their
+    environment, or ``--log-level`` on the command line all still win.
+    """
+    loader = ConfigLoader()
+    path = args.config if args.config else Path(DEFAULT_CONFIG_FILENAME)
+    loader.with_toml(path, required=args.config is not None)
+    loader.with_environ()
+    merged = loader.merged()
+
     overrides: dict[str, Any] = {}
+    level_already_set = isinstance(merged.get("logging"), dict) and "level" in merged["logging"]
     if args.log_level:
         overrides["logging"] = {"level": args.log_level}
+    elif not level_already_set:
+        overrides["logging"] = {"level": LogLevel.WARNING.value}
     if getattr(args, "host", None) or getattr(args, "port", None):
         interface: dict[str, Any] = {"enabled": True}
         if getattr(args, "host", None):
@@ -100,7 +117,9 @@ def _load(args: argparse.Namespace) -> EdenConfig:
         if getattr(args, "port", None):
             interface["port"] = args.port
         overrides["interface"] = interface
-    return load_config(config_path=args.config, overrides=overrides)
+
+    loader.with_overrides(overrides)
+    return loader.build()
 
 
 def _emit(payload: Any, *, as_json: bool) -> None:  # noqa: ANN401 - varied payloads
@@ -204,6 +223,12 @@ async def _chat(kernel: EdenKernel, namespace: str) -> int:
         if remembers:
             await kernel.memory.observe(Message.user(line), namespace=namespace)
             history = await kernel.memory.conversation.window(namespace)
+            facts = await kernel.memory.facts_message(namespace)
+            if facts is not None:
+                # Facts are looked up directly rather than carried in the
+                # rolling window, so a name stays available even once the
+                # turn that stated it has aged out of the token budget.
+                history = [facts, *history]
         messages = history or [Message.user(line)]
 
         try:

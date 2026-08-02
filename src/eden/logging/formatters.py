@@ -122,7 +122,7 @@ class JsonFormatter(logging.Formatter):
             "component": get_component(),
         }
         payload.update(_structured_fields(record))
-        if record.exc_info is not None:
+        if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
             error = record.exc_info[1]
             if isinstance(error, EdenError):
@@ -152,6 +152,6 @@ class ConsoleFormatter(logging.Formatter):
             message=record.getMessage(),
             fields=rendered_fields,
         )
-        if record.exc_info is not None:
+        if record.exc_info:
             line = f"{line}\n{self.formatException(record.exc_info)}"
         return line

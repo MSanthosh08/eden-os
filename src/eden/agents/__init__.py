@@ -15,8 +15,8 @@ therefore structural rather than a convention.
 from __future__ import annotations
 
 from eden.agents.base import BaseAgent
-from eden.agents.builtin import ConversationAgent, EchoAgent, FileTaskAgent
-from eden.agents.context import ActionOutcome, AgentContext
+from eden.agents.builtin import ConversationAgent, EchoAgent, FileTaskAgent, SearchAgent
+from eden.agents.context import ActionOutcome, AgentContext, FileHit
 from eden.agents.orchestrator import (
     COMPONENT_NAME,
     AgentOrchestrator,
@@ -42,10 +42,12 @@ __all__ = [
     "BaseAgent",
     "ConversationAgent",
     "EchoAgent",
+    "FileHit",
     "FileTaskAgent",
     "Plan",
     "PlanStep",
     "RoutingDecision",
+    "SearchAgent",
     "StepOutcome",
     "Suitability",
     "Task",

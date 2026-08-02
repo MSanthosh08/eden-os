@@ -110,6 +110,16 @@ class ExecutionEngine:
         """Return the name used in startup and shutdown logs."""
         return COMPONENT_NAME
 
+    @property
+    def config(self) -> ExecutionConfig:
+        """Return the execution policy this engine was built from.
+
+        Read-only exposure so callers — such as the agent capability surface
+        needing the workspace root for read-only file search — can see the
+        active policy without a second, possibly-diverging config channel.
+        """
+        return self._config
+
     async def start(self) -> None:
         """Prepare the workspace. Idempotent."""
         if self._started:

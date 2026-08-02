@@ -525,6 +525,8 @@ def _build_agents(raw: Mapping[str, Any]) -> AgentConfig:
         task_timeout_seconds=_pick(
             raw, "task_timeout_seconds", d.task_timeout_seconds, _as_float, prefix
         ),
+        search_roots=_pick(raw, "search_roots", d.search_roots, _as_str_tuple, prefix),
+        search_max_results=_pick(raw, "search_max_results", d.search_max_results, _as_int, prefix),
     )
 
 

@@ -538,7 +538,7 @@ class TestOrchestrator:
 
     async def test_default_roster_is_registered(self, tmp_path: Path, clock: ManualClock) -> None:
         roster = self.orchestrator(tmp_path, clock).roster()
-        assert set(roster) == {"conversation", "filetask", "echo"}
+        assert set(roster) == {"conversation", "filetask", "search", "echo"}
 
     async def test_routing_prefers_the_higher_score(
         self, tmp_path: Path, clock: ManualClock

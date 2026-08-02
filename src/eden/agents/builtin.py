@@ -1,6 +1,6 @@
 """Built-in agents.
 
-Two are shipped, chosen to span the interesting axis rather than to be
+Three are shipped, chosen to span the interesting axes rather than to be
 exhaustive.
 
 :class:`ConversationAgent` never changes anything. It reads memory, thinks, and
@@ -10,17 +10,25 @@ writes back what it learned. It is the shape most agents take.
 ``Action`` that goes through the execution pipeline, so it demonstrates that an
 agent gains nothing by wanting to act — permission still comes from policy, not
 from the agent's own confidence.
+
+:class:`SearchAgent` reads the world without a model in the loop at all. It
+answers "find X" deterministically through
+:meth:`~eden.agents.context.AgentContext.search_files`, which is the honest fix
+for what a purely conversational agent used to do with such a request: describe
+a shell command for the person to run themselves, rather than actually looking.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 from eden.agents.base import BaseAgent
+from eden.agents.context import FileHit
 from eden.agents.types import Plan, PlanStep, StepOutcome, Suitability, Task, Verification
 from eden.config.enums import ActionKind, MemoryKind, StepStatus
 from eden.core.types import Message
-from eden.errors import PlanningError
+from eden.errors import AgentCapabilityError, PlanningError
 from eden.execution.types import Action
 
 GOAL_PARAMETER = "path"
@@ -30,6 +38,30 @@ _FILE_KEYWORDS = frozenset(
     {"file", "write", "save", "create", "note", "document", "draft", "record"}
 )
 _DELETE_KEYWORDS = frozenset({"delete", "remove", "erase"})
+_SEARCH_KEYWORDS = frozenset({"search", "find", "locate", "list"})
+_FILE_NOUNS = frozenset({"file", "files", "document", "documents"})
+
+_MAX_LISTED_RESULTS = 200
+
+# A handful of common extensions a goal might name in plain English, so "list
+# all the python files" needs no explicit pattern in the task context.
+_EXTENSION_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bpython\b", re.IGNORECASE), "*.py"),
+    (re.compile(r"\bjavascript\b", re.IGNORECASE), "*.js"),
+    (re.compile(r"\btypescript\b", re.IGNORECASE), "*.ts"),
+    (re.compile(r"\bmarkdown\b", re.IGNORECASE), "*.md"),
+    (re.compile(r"\bpdf(s)?\b", re.IGNORECASE), "*.pdf"),
+    (re.compile(r"\bimage(s)?\b", re.IGNORECASE), "*.png"),
+    (re.compile(r"\bconfig(uration)?\s+files?\b", re.IGNORECASE), "*.toml"),
+)
+
+
+def _infer_pattern(goal: str) -> str:
+    """Return a glob pattern inferred from plain-English wording in ``goal``."""
+    for regex, pattern in _EXTENSION_HINTS:
+        if regex.search(goal):
+            return pattern
+    return "*"
 
 
 class ConversationAgent(BaseAgent):
@@ -254,6 +286,103 @@ class FileTaskAgent(BaseAgent):
             ),
             should_rollback=self._context.config.rollback_on_verification_failure,
         )
+
+
+class SearchAgent(BaseAgent):
+    """Finds files by name pattern, with no model in the loop.
+
+    A search is a read: it has no effect to verify, permit or roll back, so —
+    unlike :class:`FileTaskAgent` — its work never touches the execution
+    pipeline. Its answer is exactly what
+    :meth:`~eden.agents.context.AgentContext.search_files` found, not a
+    paraphrase of it, and where it is allowed to look is bounded by
+    ``agents.search_roots`` rather than by the agent's own judgement.
+    """
+
+    @property
+    def description(self) -> str:
+        """Return a one-line description."""
+        return "Finds files by name or extension within configured search roots."
+
+    def can_handle(self, task: Task) -> Suitability:
+        """Score by an explicit pattern, or by search-and-file wording."""
+        if not self._context.has_search:
+            return Suitability.no(
+                "No search roots are configured (agents.search_roots is empty "
+                "and execution is disabled)."
+            )
+        explicit = bool(task.context.get("pattern")) or bool(task.context.get("search"))
+        words = frozenset(task.goal.lower().split())
+        mentions_search = bool(words & _SEARCH_KEYWORDS)
+        names_a_file_type = bool(words & _FILE_NOUNS) or _infer_pattern(task.goal) != "*"
+        if explicit or (mentions_search and names_a_file_type):
+            return Suitability(score=0.95, reason="Goal asks to find or list files.")
+        if mentions_search:
+            return Suitability(score=0.3, reason="Mentions searching, but no file type was named.")
+        return Suitability.no("Goal does not ask to find or list files.")
+
+    async def plan(self, task: Task) -> Plan:
+        """Produce a single deterministic search step; there is nothing to draft."""
+        pattern = self._pattern_for(task)
+        return Plan(
+            task_id=task.id,
+            steps=(
+                PlanStep(
+                    description=f"Search for files matching '{pattern}'.",
+                    prompt=pattern,
+                ),
+            ),
+            rationale=f"Deterministic file search for '{pattern}'; no model call is needed.",
+        )
+
+    async def _run_thought(self, task: Task, step: PlanStep) -> StepOutcome:
+        """Run the search directly rather than consulting a model.
+
+        A factual listing of what exists on disk is not something a model
+        should be asked to produce or paraphrase — it is looked up, exactly
+        the way :class:`~eden.agents.builtin.EchoAgent` looks nothing up.
+        """
+        pattern = self._pattern_for(task)
+        roots = self._roots_for(task)
+        try:
+            hits = await self._context.search_files(pattern, roots=roots)
+        except AgentCapabilityError as exc:
+            return StepOutcome(step=step, status=StepStatus.FAILED, error=exc.to_dict())
+        return StepOutcome(
+            step=step,
+            status=StepStatus.SUCCEEDED,
+            output=self._format(hits, pattern),
+        )
+
+    @staticmethod
+    def _pattern_for(task: Task) -> str:
+        """Return an explicit pattern from context, or one inferred from the goal."""
+        explicit = task.context.get("pattern")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        return _infer_pattern(task.goal)
+
+    @staticmethod
+    def _roots_for(task: Task) -> tuple[str, ...]:
+        """Return any roots the task requested, narrowing rather than widening."""
+        raw = task.context.get("roots")
+        if isinstance(raw, list | tuple):
+            return tuple(str(item) for item in raw)
+        return ()
+
+    @staticmethod
+    def _format(hits: Sequence[FileHit], pattern: str) -> str:
+        """Render results as a neat, bounded listing."""
+        if not hits:
+            return (
+                f"No files matching '{pattern}' were found within the " "configured search roots."
+            )
+        shown = hits[:_MAX_LISTED_RESULTS]
+        lines = [f"Found {len(hits)} file(s) matching '{pattern}':", ""]
+        lines.extend(f"  {hit.path}" for hit in shown)
+        if len(hits) > len(shown):
+            lines.append(f"  ... and {len(hits) - len(shown)} more.")
+        return "\n".join(lines)
 
 
 class EchoAgent(BaseAgent):

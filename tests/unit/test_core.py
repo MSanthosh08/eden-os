@@ -223,6 +223,48 @@ class TestTiming:
             raise EdenError("bad")
         assert caplog.records[-1].__dict__["outcome"] == "error"
 
+    def test_eden_error_failure_does_not_crash_the_console_formatter(self) -> None:
+        """Regression: exc_info=False left record.exc_info as a literal False,
+        which the formatters' old `is not None` check tried to subscript."""
+        from eden.logging.formatters import ConsoleFormatter
+
+        logger = get_logger("eden.test.timing.regression")
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            with pytest.raises(EdenError), timed_block(logger, "unit"):
+                raise EdenError("bad")
+        finally:
+            logger.removeHandler(handler)
+
+        record = captured[-1]
+        assert record.exc_info is None
+        ConsoleFormatter().format(record)  # must not raise
+
+    def test_non_eden_error_failure_does_carry_a_traceback(self) -> None:
+        logger = get_logger("eden.test.timing.regression2")
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        handler = _Capture()
+        logger.addHandler(handler)
+        try:
+            with pytest.raises(RuntimeError), timed_block(logger, "unit"):
+                raise RuntimeError("boom")
+        finally:
+            logger.removeHandler(handler)
+
+        assert captured[-1].exc_info is not None
+
     async def test_decorator_supports_async(self) -> None:
         logger = get_logger("eden.test.timing")
 

@@ -115,7 +115,7 @@ def build_router(kernel: EdenKernel, gate: WebApprovalGate | None = None) -> Rou
         hits = await kernel.memory.recall(
             MemoryQuery(
                 text=request.query.get("q", ""),
-                namespace=request.query.get("namespace", "default"),
+                namespace=request.query.get("namespace", "cli"),
                 limit=int(request.query.get("limit", _DEFAULT_RECALL_LIMIT)),
             )
         )
@@ -163,12 +163,30 @@ def build_router(kernel: EdenKernel, gate: WebApprovalGate | None = None) -> Rou
     # Mutation
     # ------------------------------------------------------------------
     async def chat(request: Request) -> Response:
-        """Generate a reply through the gateway."""
+        """Generate a reply through the gateway, remembering the exchange.
+
+        Mirrors the CLI's ``eden chat`` behaviour: the turn is observed, a
+        durable-facts preamble is prepended so a stated name survives
+        regardless of the token window, and the reply is remembered in turn.
+        """
         payload = request.json()
         message = str(payload.get("message", "")).strip()
         if not message:
             raise InterfaceError("A 'message' field is required.")
-        response = await kernel.gateway.chat(ChatRequest(messages=[Message.user(message)]))
+        namespace = str(payload.get("namespace") or "cli")
+
+        messages: list[Message] = [Message.user(message)]
+        remembers = kernel.config.memory.enabled
+        if remembers:
+            await kernel.memory.observe(Message.user(message), namespace=namespace)
+            messages = await kernel.memory.conversation.window(namespace)
+            facts = await kernel.memory.facts_message(namespace)
+            if facts is not None:
+                messages = [facts, *messages]
+
+        response = await kernel.gateway.chat(ChatRequest(messages=messages))
+        if remembers:
+            await kernel.memory.observe(Message.assistant(response.content), namespace=namespace)
         return Response.json(
             {
                 "content": response.content,

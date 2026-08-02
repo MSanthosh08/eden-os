@@ -27,6 +27,12 @@ from eden.memory.consolidation import (
     Summariser,
 )
 from eden.memory.conversation import ConversationMemory, ProjectMemory
+from eden.memory.facts import (
+    ExtractedFact,
+    FactExtractor,
+    HeuristicFactExtractor,
+    NullFactExtractor,
+)
 from eden.memory.manager import MemoryManager, build_memory_manager
 from eden.memory.repository import (
     InMemoryRecordRepository,
@@ -59,10 +65,13 @@ __all__ = [
     "Consolidator",
     "ConversationMemory",
     "Embedder",
+    "ExtractedFact",
     "ExtractiveSummariser",
+    "FactExtractor",
     "GatewayEmbedder",
     "GatewaySummariser",
     "HashEmbedder",
+    "HeuristicFactExtractor",
     "InMemoryRecordRepository",
     "JsonlRecordRepository",
     "LongTermMemory",
@@ -70,6 +79,7 @@ __all__ = [
     "MemoryQuery",
     "MemoryRecord",
     "MemoryStore",
+    "NullFactExtractor",
     "ProjectMemory",
     "RecordRepository",
     "SearchHit",

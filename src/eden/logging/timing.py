@@ -99,10 +99,16 @@ def timed_block(
         yield watch
     except Exception as exc:
         duration = watch.stop()
+        # Only pass exc_info when we actually want a traceback attached.
+        # Stdlib logging converts a *truthy* exc_info into a proper
+        # (type, value, tb) tuple, but leaves a falsy value — e.g. False —
+        # stored verbatim on the record. A formatter that then checks
+        # `record.exc_info is not None` sees False and tries to subscript it.
+        include_traceback = not isinstance(exc, EdenError)
         logger.error(
             "Operation failed.",
             extra=_fields(operation, duration, outcome="error", error=exc, extra=fields),
-            exc_info=not isinstance(exc, EdenError),
+            **({"exc_info": True} if include_traceback else {}),
         )
         raise
     else:

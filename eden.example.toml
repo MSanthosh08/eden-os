@@ -57,6 +57,13 @@ planning_model = ""               # empty lets the router choose
 recall_limit = 5                  # memories pulled into an agent's context
 task_timeout_seconds = 300.0
 
+# Directories the search agent may look inside, beyond the execution
+# workspace (which is always searchable). Empty by default — searching your
+# whole disk is not something an agent gets just by installing EDEN, the same
+# way a shell command is not runnable until named in execution.allowed_commands.
+search_roots = ["/home/s"]
+# search_roots = ["/home/you/projects/myapp"]
+
 # ---------------------------------------------------------------------------
 # Execution.
 #

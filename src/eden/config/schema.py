@@ -528,6 +528,12 @@ class AgentConfig:
         recall_limit: Memories retrieved when building an agent's context.
         default_namespace: Namespace used when a task does not name one.
         task_timeout_seconds: Wall-clock budget for one whole task.
+        search_roots: Directories a file-search agent may look inside, in
+            addition to the execution workspace. Empty by default — reading
+            the whole filesystem is not something an agent gets by installing
+            EDEN, the same way running a shell command is not until it is
+            named in ``execution.allowed_commands``.
+        search_max_results: Ceiling on files returned by one search.
     """
 
     enabled: bool = True
@@ -539,6 +545,8 @@ class AgentConfig:
     recall_limit: int = 5
     default_namespace: str = "default"
     task_timeout_seconds: float = 300.0
+    search_roots: tuple[str, ...] = ()
+    search_max_results: int = 500
 
     def __post_init__(self) -> None:
         """Validate the constraints.
@@ -549,6 +557,7 @@ class AgentConfig:
         _require_positive(self.max_plan_steps, "agents.max_plan_steps")
         _require_positive(self.recall_limit, "agents.recall_limit")
         _require_positive(self.task_timeout_seconds, "agents.task_timeout_seconds")
+        _require_positive(self.search_max_results, "agents.search_max_results")
         if not 0.0 <= self.min_suitability <= 1.0:
             raise InvalidConfigError(
                 "Minimum suitability must be between 0 and 1.",

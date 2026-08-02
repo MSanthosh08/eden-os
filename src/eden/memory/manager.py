@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from eden.config.enums import MemoryKind
+from eden.config.enums import MemoryKind, Role
 from eden.config.schema import MemoryConfig, PathsConfig
 from eden.core.types import Message
 from eden.errors import MemorySubsystemError
@@ -31,6 +31,7 @@ from eden.memory.consolidation import (
     Summariser,
 )
 from eden.memory.conversation import ConversationMemory, ProjectMemory
+from eden.memory.facts import FactExtractor, HeuristicFactExtractor
 from eden.memory.repository import (
     InMemoryRecordRepository,
     JsonlRecordRepository,
@@ -68,6 +69,7 @@ class MemoryManager:
         project: ProjectMemory | None = None,
         weights: Mapping[MemoryKind, float] | None = None,
         consolidator: Consolidator | None = None,
+        fact_extractor: FactExtractor | None = None,
     ) -> None:
         """Initialise the manager.
 
@@ -79,6 +81,10 @@ class MemoryManager:
             weights: Per-kind editorial weights applied when merging.
             consolidator: Compresses old conversation turns into long-term
                 memory. Absent means conversations grow without bound.
+            fact_extractor: Recognises durable facts — a name, a location — in
+                each user turn and promotes them into project memory, where
+                they survive regardless of the conversation's token budget.
+                Absent means nothing is extracted automatically.
         """
         self._config = config
         self._stores = list(stores)
@@ -86,6 +92,7 @@ class MemoryManager:
         self._project = project
         self._weights = dict(weights or DEFAULT_STORE_WEIGHTS)
         self._consolidator = consolidator
+        self._fact_extractor = fact_extractor
         self._started = False
 
     # ------------------------------------------------------------------
@@ -211,10 +218,75 @@ class MemoryManager:
     ) -> MemoryRecord:
         """Record a conversation turn.
 
+        User turns are additionally scanned for durable facts — a stated name,
+        location or occupation — which are promoted into project memory. That
+        promotion is what lets a fact outlive the conversation's token budget:
+        the raw turn can age out of the window while the fact remains.
+
+        A failure during extraction or promotion is logged and swallowed
+        rather than raised: losing a nice-to-have fact must never cost the
+        conversation turn itself.
+
         Raises:
             MemorySubsystemError: If conversation memory is not configured.
         """
-        return await self.conversation.append_turn(message, namespace=namespace)
+        record = await self.conversation.append_turn(message, namespace=namespace)
+        if self._fact_extractor is not None and message.role is Role.USER:
+            await self._extract_facts(message.content, namespace)
+        return record
+
+    async def _extract_facts(self, text: str, namespace: str) -> None:
+        """Recognise and durably store any facts found in ``text``."""
+        if self._fact_extractor is None or self._project is None:
+            return
+        try:
+            facts = self._fact_extractor.extract(text)
+        except Exception as exc:  # noqa: BLE001 - extraction must never break chat
+            _LOGGER.warning(
+                "Fact extraction failed; continuing without it.",
+                extra={"namespace": namespace, "error_type": type(exc).__name__},
+            )
+            return
+        for fact in facts:
+            try:
+                await self._project.remember_fact(fact.key, fact.value, project=namespace)
+            except MemorySubsystemError as exc:
+                _LOGGER.warning(
+                    "Could not store an extracted fact.",
+                    extra={
+                        "namespace": namespace,
+                        "key": fact.key,
+                        "error_code": exc.code,
+                    },
+                )
+            else:
+                _LOGGER.debug(
+                    "Extracted a durable fact from conversation.",
+                    extra={"namespace": namespace, "key": fact.key},
+                )
+
+    async def facts_message(self, namespace: str) -> Message | None:
+        """Return a system message summarising known facts, or ``None``.
+
+        Prepending this to a prompt is what makes a fact like a name available
+        regardless of how long the conversation has grown — it does not
+        compete with ordinary turns for the token budget the same way, since it
+        is looked up directly rather than carried in the rolling window.
+
+        Args:
+            namespace: Project namespace to read facts from.
+
+        Returns:
+            A system message listing known facts, or ``None`` when project
+            memory is not configured or holds nothing yet.
+        """
+        if self._project is None:
+            return None
+        facts = await self._project.facts(project=namespace)
+        if not facts:
+            return None
+        lines = "; ".join(f"{key}: {value}" for key, value in sorted(facts.items()))
+        return Message.system(f"Known facts about this person: {lines}.")
 
     # ------------------------------------------------------------------
     # Read
@@ -353,6 +425,7 @@ def build_memory_manager(
     gateway: GatewayClient | None = None,
     embedder: Embedder | None = None,
     summariser: Summariser | None = None,
+    fact_extractor: FactExtractor | None = None,
 ) -> MemoryManager:
     """Construct a fully wired memory subsystem.
 
@@ -367,6 +440,9 @@ def build_memory_manager(
             credentials and no network.
         embedder: Explicit embedder override, primarily for tests.
         summariser: Explicit summariser override, primarily for tests.
+        fact_extractor: Explicit extractor override. Defaults to
+            :class:`~eden.memory.facts.HeuristicFactExtractor`, so a name or
+            location stated in chat is durable without any configuration.
 
     Returns:
         A ready-to-start manager.
@@ -403,10 +479,15 @@ def build_memory_manager(
     else:
         resolved_summariser = ExtractiveSummariser()
 
+    resolved_extractor: FactExtractor = (
+        fact_extractor if fact_extractor is not None else HeuristicFactExtractor()
+    )
+
     return MemoryManager(
         config,
         [short_term, long_term, vector, conversation, project.store],
         conversation=conversation,
         project=project,
         consolidator=Consolidator(config, conversation, long_term, resolved_summariser),
+        fact_extractor=resolved_extractor,
     )

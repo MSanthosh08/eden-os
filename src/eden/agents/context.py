@@ -13,12 +13,26 @@ exposes anything beneath it.
 Subsystems are optional. An EDEN with execution disabled still runs agents; they
 simply find that :meth:`act` refuses, which is the honest outcome rather than a
 crash on startup.
+
+:meth:`AgentContext.search_files` is the one capability here that is *not*
+gated by the execution pipeline, on the same reasoning ADR-0006 applied to
+hardware: a search only reads, it has no effect to verify or roll back. What it
+does need — and what a hardware read does not — is a boundary on *where* it may
+read, since a file's path can itself be sensitive. That boundary is
+``agents.search_roots``, empty by default: reading the whole filesystem is not
+something an agent gets by installing EDEN, the same way running a shell
+command is not until it is named in ``execution.allowed_commands``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from fnmatch import fnmatch
+from pathlib import Path
 
 from eden.config.enums import MemoryKind
 from eden.config.schema import AgentConfig
@@ -32,6 +46,62 @@ from eden.memory.manager import MemoryManager
 from eden.memory.types import MemoryQuery, MemoryRecord, SearchHit
 
 _LOGGER = get_logger("agents.context")
+
+# Pruned during traversal without ever being descended into. This is a
+# performance and relevance filter, not a security boundary — the security
+# boundary is root confinement plus _SENSITIVE_NAME_GLOBS below.
+_SKIPPED_DIRECTORY_NAMES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".idea",
+        ".vscode",
+    }
+)
+
+# Files matching any of these are never returned, regardless of the requested
+# pattern. A search for "*" must not be a way to enumerate credential names.
+_SENSITIVE_NAME_GLOBS = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+    "credentials*",
+    "*.token",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FileHit:
+    """One file found by :meth:`AgentContext.search_files`.
+
+    Attributes:
+        path: Absolute path.
+        size_bytes: File size at the time of the search.
+        modified_at: Last-modified time.
+    """
+
+    path: str
+    size_bytes: int
+    modified_at: datetime
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serialisable representation."""
+        return {
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+            "modified_at": self.modified_at.isoformat(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +168,17 @@ class AgentContext:
     def has_execution(self) -> bool:
         """Return whether this context can change the world."""
         return self._execution is not None
+
+    @property
+    def has_search(self) -> bool:
+        """Return whether at least one root is available to search.
+
+        True when an operator has named a root in ``agents.search_roots``, or
+        when execution is enabled (its workspace is always an implicit root).
+        False means an agent should decline rather than search nothing and
+        call that an answer.
+        """
+        return bool(self._config.search_roots) or self._execution is not None
 
     @property
     def memory(self) -> MemoryManager:
@@ -297,3 +378,126 @@ class AgentContext:
                 context={"key": "execution.enabled"},
             )
         return self._execution
+
+    # ------------------------------------------------------------------
+    # Searching
+    # ------------------------------------------------------------------
+    async def search_files(
+        self,
+        pattern: str = "*",
+        *,
+        roots: Sequence[str] = (),
+        limit: int | None = None,
+    ) -> list[FileHit]:
+        """Find files matching ``pattern`` under the configured search roots.
+
+        This is a read, not an effect: it has nothing to verify, permit or roll
+        back, so — unlike a write — it does not go through the execution
+        pipeline. What it does enforce is a *location* boundary, since a path
+        can itself be sensitive: only configured roots are ever descended into,
+        every candidate is resolved through symlinks before being checked, and
+        credential-shaped filenames are excluded regardless of ``pattern``.
+
+        Args:
+            pattern: A glob matched against the filename, e.g. ``"*.py"``.
+            roots: Additional roots to search, beyond the configured ones. Each
+                is still required to resolve inside a configured root — this
+                narrows where a search may look, it can never widen it. A
+                caller cannot use this to reach outside what an operator
+                already allowed.
+            limit: Ceiling on results. Defaults to ``agents.search_max_results``.
+
+        Returns:
+            Matching files, sorted by path, truncated to the limit.
+
+        Raises:
+            AgentCapabilityError: If no search root is configured at all.
+        """
+        allowed = self._search_roots()
+        if not allowed:
+            raise AgentCapabilityError(
+                "No search roots are configured. Add paths to "
+                "agents.search_roots in eden.toml, or enable execution so its "
+                "workspace becomes searchable.",
+                context={"key": "agents.search_roots"},
+            )
+        targets = self._narrow_roots(roots, allowed) if roots else allowed
+        ceiling = limit or self._config.search_max_results
+        return await asyncio.to_thread(self._walk, targets, pattern, ceiling)
+
+    def _search_roots(self) -> list[Path]:
+        """Return every configured root, resolved and de-duplicated."""
+        candidates = list(self._config.search_roots)
+        if self._execution is not None:
+            candidates.append(str(self._execution.config.workspace_root))
+        resolved = {_resolve(Path(candidate)) for candidate in candidates}
+        return sorted(resolved)
+
+    @staticmethod
+    def _narrow_roots(requested: Sequence[str], allowed: Sequence[Path]) -> list[Path]:
+        """Return the requested roots that resolve inside an allowed root.
+
+        A root outside every allowed root is silently dropped rather than
+        raised: an agent narrowing its own search to somewhere disallowed is a
+        no-op, not an escalation, and should not fail the whole search.
+        """
+        narrowed: list[Path] = []
+        for raw in requested:
+            candidate = _resolve(Path(raw))
+            if any(_is_within(candidate, root) for root in allowed):
+                narrowed.append(candidate)
+            else:
+                _LOGGER.warning(
+                    "Ignoring a requested search root outside the allowed set.",
+                    extra={"requested": raw},
+                )
+        return narrowed or list(allowed)
+
+    @staticmethod
+    def _walk(roots: Sequence[Path], pattern: str, limit: int) -> list[FileHit]:
+        """Walk every root, collecting matches up to ``limit``.
+
+        Runs off the event loop via ``asyncio.to_thread``: a large tree walk is
+        blocking I/O, and nothing here awaits anything.
+        """
+        hits: list[FileHit] = []
+        seen: set[Path] = set()
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for current_dir, subdirs, filenames in os.walk(root):
+                subdirs[:] = [name for name in subdirs if name not in _SKIPPED_DIRECTORY_NAMES]
+                for filename in filenames:
+                    if len(hits) >= limit:
+                        return hits
+                    if not fnmatch(filename, pattern):
+                        continue
+                    if any(fnmatch(filename, sensitive) for sensitive in _SENSITIVE_NAME_GLOBS):
+                        continue
+                    path = Path(current_dir) / filename
+                    if path in seen:
+                        continue
+                    seen.add(path)
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    hits.append(
+                        FileHit(
+                            path=str(path),
+                            size_bytes=stat.st_size,
+                            modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
+                        )
+                    )
+        hits.sort(key=lambda hit: hit.path)
+        return hits
+
+
+def _resolve(path: Path) -> Path:
+    """Return an absolute, symlink-resolved path even if it does not exist."""
+    return Path(os.path.realpath(path.expanduser()))
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """Return whether ``candidate`` lies inside or at ``root``."""
+    return candidate == root or root in candidate.parents

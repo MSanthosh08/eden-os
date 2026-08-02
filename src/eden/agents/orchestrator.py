@@ -278,6 +278,7 @@ def build_orchestrator(
         ConversationAgent,
         EchoAgent,
         FileTaskAgent,
+        SearchAgent,
     )
 
     context = AgentContext(config, gateway, memory=memory, execution=execution)
@@ -287,6 +288,7 @@ def build_orchestrator(
         else [
             ConversationAgent(context),
             FileTaskAgent(context),
+            SearchAgent(context),
             EchoAgent(context),
         ]
     )
